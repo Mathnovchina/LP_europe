@@ -1,6 +1,7 @@
 """Build the 1995-2022 macro panel directly from Eurostat."""
 from __future__ import annotations
 
+import io
 import re
 from functools import reduce
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import xlrd
 from eurostat import get_data_df
+import requests
 
 COUNTRIES = [
     "AT",
@@ -46,6 +48,42 @@ YEARS = range(1995, 2023)
 ANNUAL_TIMES = [str(year) for year in YEARS]
 MONTHLY_TIMES = [f"{year}M{month:02d}" for year in YEARS for month in range(1, 13)]
 TIME_COL_PATTERN = re.compile(r"^\d{4}")
+
+COFOG_TOTAL_CODES = [f"GF{i:02d}" for i in range(1, 11)]
+
+ISO2_TO_ISO3 = {
+    "AT": "AUT",
+    "BE": "BEL",
+    "BG": "BGR",
+    "CY": "CYP",
+    "CZ": "CZE",
+    "DE": "DEU",
+    "DK": "DNK",
+    "EE": "EST",
+    "EL": "GRC",
+    "ES": "ESP",
+    "FI": "FIN",
+    "FR": "FRA",
+    "HR": "HRV",
+    "HU": "HUN",
+    "IE": "IRL",
+    "IT": "ITA",
+    "LT": "LTU",
+    "LU": "LUX",
+    "LV": "LVA",
+    "CH": "CHE",
+    "MT": "MLT",
+    "NL": "NLD",
+    "NO": "NOR",
+    "PL": "POL",
+    "PT": "PRT",
+    "RO": "ROU",
+    "SE": "SWE",
+    "SI": "SVN",
+    "SK": "SVK",
+    "UK": "GBR",
+    "IS": "ISL",
+}
 
 TABLES = {
     "gdp_nominal": {
@@ -164,6 +202,14 @@ TABLES = {
         },
         "annual_mean": True,
     },
+    "long_rate_ecb": {
+        "code": "irt_lt_mcby_a",
+        "filters": {
+            "freq": "A",
+            "int_rt": "MCBY",
+            "time": ANNUAL_TIMES,
+        },
+    },
 }
 
 # Source https://www.indexmundi.com/facts/malta/indicator/NY.GDP.DEFL.ZS#:~:text=1994%2066,71
@@ -274,6 +320,135 @@ def _load_legacy_population(path: Path = Path("dataset.xls")) -> pd.DataFrame:
     return legacy
 
 
+def _load_public_consumption_total() -> pd.DataFrame:
+    base_filters = {
+        "freq": "A",
+        "sector": "S13",
+        "na_item": "P3",
+        "unit": "MIO_EUR",
+        "time": ANNUAL_TIMES,
+    }
+    parts = []
+    for cofog_code in COFOG_TOTAL_CODES:
+        filters = {**base_filters, "cofog99": cofog_code}
+        part = _reshape_series("public_consumption_component", "gov_10a_exp", filters)
+        parts.append(part)
+
+    combined = pd.concat(parts, ignore_index=True)
+    total = (
+        combined.groupby(["geo", "time"], as_index=False)["public_consumption_component"].sum()
+    )
+    return total.rename(columns={"public_consumption_component": "public_consumption"})
+
+
+def _load_oecd_long_rate(start_year: int = YEARS.start, end_year: int = YEARS.stop - 1) -> pd.DataFrame:
+    iso3_list = [ISO2_TO_ISO3[c] for c in COUNTRIES if c in ISO2_TO_ISO3]
+    start_period = str(start_year)
+    end_period = str(end_year)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv",
+    }
+
+    frames = []
+    for iso3 in iso3_list:
+        url = (
+            "https://sdmx.oecd.org/public/rest/data/"
+            "OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/"
+            f"{iso3}.A.IRLT.PA....."
+            f"?startPeriod={start_period}&endPeriod={end_period}"
+            "&dimensionAtObservation=AllDimensions"
+        )
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            df_raw = pd.read_csv(io.StringIO(resp.text))
+        except Exception as exc:  # pragma: no cover
+            print(f"OECD long-rate fetch failed for {iso3}: {exc}")
+            continue
+
+        if df_raw.empty:
+            continue
+
+        df = df_raw[["REF_AREA", "TIME_PERIOD", "OBS_VALUE", "MEASURE", "UNIT_MEASURE", "FREQ"]].copy()
+        df = df[(df["MEASURE"] == "IRLT") & (df["UNIT_MEASURE"] == "PA") & (df["FREQ"] == "A")]
+        df = df.rename(
+            columns={"REF_AREA": "iso3", "TIME_PERIOD": "time", "OBS_VALUE": "long_rate_oecd"}
+        )
+        df["time"] = pd.to_numeric(df["time"], errors="coerce").astype("Int64")
+        iso3_to_iso2 = {v: k for k, v in ISO2_TO_ISO3.items()}
+        df["geo"] = df["iso3"].map(iso3_to_iso2)
+        df = df.dropna(subset=["geo", "time", "long_rate_oecd"])
+        df = df[df["geo"].isin(COUNTRIES)]
+        df = df[(df["time"] >= start_year) & (df["time"] <= end_year)]
+        frames.append(df[["geo", "time", "long_rate_oecd"]])
+
+    if not frames:
+        print("OECD long-rate fetch returned empty dataset")
+        return pd.DataFrame(columns=["geo", "time", "long_rate_oecd"])
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def _load_oecd_outlook_long_rate(path: Path = Path("data") / "Economic_Outlook_116.csv") -> pd.DataFrame:
+    if not path.exists():
+        print(f"OECD Outlook file {path} not found; skipping")
+        return pd.DataFrame(columns=["geo", "time", "long_rate_oecd_outlook"])
+
+    outlook = pd.read_csv(path)
+
+    col_map = {
+        "Austria": "AT",
+        "Belgium": "BE",
+        "Bulgaria": "BG",
+        "Croatia": "HR",
+        "Czechia": "CZ",
+        "Denmark": "DK",
+        "Finland": "FI",
+        "France": "FR",
+        "Germany": "DE",
+        "Greece": "EL",
+        "Hungary": "HU",
+        "Iceland": "IS",
+        "Ireland": "IE",
+        "Italy": "IT",
+        "Latvia": "LV",
+        "Lithuania": "LT",
+        "Luxembourg": "LU",
+        "Netherlands": "NL",
+        "Norway": "NO",
+        "Poland": "PL",
+        "Portugal": "PT",
+        "Romania": "RO",
+        "Slovak Republic": "SK",
+        "Slovenia": "SI",
+        "Spain": "ES",
+        "Sweden": "SE",
+        "Switzerland": "CH",
+        "United Kingdom": "UK",
+    }
+
+    keep_cols = {name: iso for name, iso in col_map.items() if name in outlook.columns}
+    outlook = outlook.rename(columns={"Date": "time", **keep_cols})
+
+    value_cols = list(keep_cols.values())
+    if not value_cols:
+        print("No OECD Outlook country columns present; skipping")
+        return pd.DataFrame(columns=["geo", "time", "long_rate_oecd_outlook"])
+
+    tidy = outlook.melt(
+        id_vars=["time"], value_vars=value_cols, var_name="geo", value_name="long_rate_oecd_outlook"
+    )
+    tidy["time"] = pd.to_numeric(tidy["time"], errors="coerce").astype("Int64")
+    tidy["long_rate_oecd_outlook"] = pd.to_numeric(tidy["long_rate_oecd_outlook"], errors="coerce")
+    tidy = tidy.dropna(subset=["time"])
+    tidy = tidy[tidy["geo"].isin(COUNTRIES)]
+    tidy = tidy[(tidy["time"] >= YEARS.start) & (tidy["time"] <= YEARS.stop - 1)]
+    tidy = tidy.dropna(subset=["long_rate_oecd_outlook"])
+
+    return tidy[["geo", "time", "long_rate_oecd_outlook"]]
+
+
 def main() -> None:
     series_frames = []
     for name, meta in TABLES.items():
@@ -285,6 +460,10 @@ def main() -> None:
                 annual_mean=meta.get("annual_mean", False),
             )
         )
+
+    series_frames.append(_load_public_consumption_total())
+    series_frames.append(_load_oecd_long_rate())
+    series_frames.append(_load_oecd_outlook_long_rate())
 
     panel = reduce(lambda left, right: pd.merge(left, right, on=["geo", "time"], how="outer"), series_frames)
 
@@ -315,6 +494,7 @@ def main() -> None:
     panel["env_investment_const_2015"] = panel["env_investment"] / denom * 100
     panel["env_total_const_2015"] = panel["env_consumption_const_2015"] + panel["env_investment_const_2015"]
     panel["env_total"] = panel["env_investment"] + panel["env_consumption"]
+    panel["public_consumption_const_2015"] = panel["public_consumption"] / denom * 100
 
     panel["gfcf_private"] = panel["gfcf_total"] - panel["gfcf_public"]
     panel["gfcf_total_const_2015"] = panel["gfcf_total"] / denom * 100
@@ -323,6 +503,23 @@ def main() -> None:
 
     panel["gdp_nominal_bln"] = panel["gdp_nominal"] / 1000.0
     panel["value_added_per_1000_workers"] = panel["value_added"] / panel["workers_thousands"].replace({0: pd.NA})
+
+    panel["long_rate_filled"] = panel["long_rate"]
+    panel["long_rate_source"] = pd.NA
+    eurostat_mask = panel["long_rate"].notna()
+    panel.loc[eurostat_mask, "long_rate_source"] = "eurostat"
+
+    missing_long = panel["long_rate_filled"].isna() & panel["long_rate_oecd"].notna()
+    panel.loc[missing_long, "long_rate_filled"] = panel.loc[missing_long, "long_rate_oecd"]
+    panel.loc[missing_long, "long_rate_source"] = "oecd_mei_fin"
+
+    missing_long_outlook = panel["long_rate_filled"].isna() & panel["long_rate_oecd_outlook"].notna()
+    panel.loc[missing_long_outlook, "long_rate_filled"] = panel.loc[missing_long_outlook, "long_rate_oecd_outlook"]
+    panel.loc[missing_long_outlook, "long_rate_source"] = "oecd_outlook_116"
+
+    missing_long_ecb = panel["long_rate_filled"].isna() & panel["long_rate_ecb"].notna()
+    panel.loc[missing_long_ecb, "long_rate_filled"] = panel.loc[missing_long_ecb, "long_rate_ecb"]
+    panel.loc[missing_long_ecb, "long_rate_source"] = "ecb_mcby"
 
     legacy_gfcf = _load_legacy_gfcf()
     if legacy_gfcf.empty:
@@ -340,8 +537,15 @@ def main() -> None:
 
     out_path = Path("data") / "eurostat_green_panel.csv"
     out_path.parent.mkdir(exist_ok=True)
-    panel.to_csv(out_path, index=False)
-    print(f"Saved {len(panel)} rows to {out_path}")
+    try:
+        panel.to_csv(out_path, index=False)
+        print(f"Saved {len(panel)} rows to {out_path}")
+    except PermissionError:
+        fallback = Path("data") / "eurostat_green_panel_unlocked.csv"
+        panel.to_csv(fallback, index=False)
+        print(
+            f"Permission denied on {out_path}; wrote {len(panel)} rows to {fallback} instead."
+        )
 
 
 if __name__ == "__main__":
